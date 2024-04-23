@@ -11,8 +11,8 @@ import (
 	"path"
 	"sort"
 
-	"github.com/CloudSnorkel/standalone-soci-indexer/utils/log"
-	registryutils "github.com/CloudSnorkel/standalone-soci-indexer/utils/registry"
+	"github.com/sofatutor/standalone-soci-indexer/utils/log"
+	registryutils "github.com/sofatutor/standalone-soci-indexer/utils/registry"
 	"github.com/containerd/containerd/images"
 	"oras.land/oras-go/v2/content/oci"
 

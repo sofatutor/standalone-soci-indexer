@@ -24,7 +24,7 @@ import (
 	"github.com/aws/aws-sdk-go/service/ecr"
 	"github.com/awslabs/soci-snapshotter/soci/store"
 
-	"github.com/CloudSnorkel/standalone-soci-indexer/utils/log"
+	"github.com/sofatutor/standalone-soci-indexer/utils/log"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 )
 

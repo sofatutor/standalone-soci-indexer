@@ -3,7 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
-	"github.com/CloudSnorkel/standalone-soci-indexer/utils/log"
+	"github.com/sofatutor/standalone-soci-indexer/utils/log"
 	"github.com/spf13/cobra"
 	"os"
 	"strings"

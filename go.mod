@@ -1,4 +1,4 @@
-module github.com/CloudSnorkel/standalone-soci-indexer
+module github.com/sofatutor/standalone-soci-indexer
 
 go 1.18
 
