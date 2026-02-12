@@ -9,32 +9,26 @@ import (
 	"fmt"
 	"os"
 	"path"
-	"sort"
 
 	"github.com/sofatutor/standalone-soci-indexer/utils/log"
 	registryutils "github.com/sofatutor/standalone-soci-indexer/utils/registry"
+
+	"github.com/containerd/containerd/content"
+	"github.com/containerd/containerd/content/local"
 	"github.com/containerd/containerd/images"
 	"oras.land/oras-go/v2/content/oci"
 
 	"github.com/awslabs/soci-snapshotter/soci"
 	"github.com/awslabs/soci-snapshotter/soci/store"
-	"github.com/containerd/containerd/content"
-	"github.com/containerd/containerd/content/local"
-	"github.com/containerd/containerd/platforms"
 
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
-)
-
-// TODO: Remove this once the SOCI library exports this error.
-var (
-	ErrEmptyIndex = errors.New("no ztocs created, all layers either skipped or produced errors")
 )
 
 const (
 	BuildFailedMessage          = "SOCI index build error"
 	PushFailedMessage           = "SOCI index push error"
 	SkipPushOnEmptyIndexMessage = "Skipping pushing SOCI index as it does not contain any zTOCs"
-	BuildAndPushSuccessMessage  = "Successfully built and pushed SOCI index"
+	BuildAndPushSuccessMessage  = "Successfully built and pushed SOCI v2 index"
 
 	artifactsStoreName = "store"
 	artifactsDbName    = "artifacts.db"
@@ -77,17 +71,17 @@ func indexAndPush(ctx context.Context, repo string, digest string, registryUrl s
 		Target: *desc,
 	}
 
-	indexDescriptor, err := buildIndex(ctx, dataDir, sociStore, image)
+	ociIndexDesc, err := buildIndex(ctx, dataDir, sociStore, image)
 	if err != nil {
-		if err.Error() == ErrEmptyIndex.Error() {
+		if errors.Is(err, soci.ErrEmptyIndex) {
 			log.Warn(ctx, SkipPushOnEmptyIndexMessage)
 			return SkipPushOnEmptyIndexMessage, nil
 		}
 		return logAndReturnError(ctx, BuildFailedMessage, err)
 	}
-	ctx = context.WithValue(ctx, "SOCIIndexDigest", indexDescriptor.Digest.String())
+	ctx = context.WithValue(ctx, "SOCIIndexDigest", ociIndexDesc.Digest.String())
 
-	err = registry.Push(ctx, sociStore, *indexDescriptor, repo)
+	err = registry.Push(ctx, sociStore, *ociIndexDesc, repo)
 	if err != nil {
 		return logAndReturnError(ctx, PushFailedMessage, err)
 	}
@@ -112,19 +106,16 @@ func cleanUp(ctx context.Context, dataDir string) {
 	}
 }
 
-// Init containerd store
+// Init containerd store — shares the same blob directory as the OCI store so that
+// the SOCI index builder can read image layers pulled via oras.
 func initContainerdStore(dataDir string) (content.Store, error) {
-	containerdStore, err := local.NewStore(path.Join(dataDir, artifactsStoreName))
-	return containerdStore, err
+	return local.NewStore(path.Join(dataDir, artifactsStoreName))
 }
 
 // Init SOCI artifact store
 func initSociStore(ctx context.Context, dataDir string) (*store.SociStore, error) {
-	// Note: We are wrapping an *oci.Store in a store.SociStore because soci.WriteSociIndex
-	// expects a store.Store, an interface that extends the oci.Store to provide support
-	// for garbage collection.
 	ociStore, err := oci.NewWithContext(ctx, path.Join(dataDir, artifactsStoreName))
-	return &store.SociStore{ociStore}, err
+	return &store.SociStore{Store: ociStore}, err
 }
 
 // Init a new instance of SOCI artifacts DB
@@ -137,10 +128,11 @@ func initSociArtifactsDb(dataDir string) (*soci.ArtifactsDb, error) {
 	return artifactsDb, nil
 }
 
-// Build soci index for an image and returns its ocispec.Descriptor
+// buildIndex creates a SOCI v2 index for the image and wraps it together with
+// the (annotated) image manifest into an OCI image index. The returned descriptor
+// is the OCI image index that should be pushed to the registry.
 func buildIndex(ctx context.Context, dataDir string, sociStore *store.SociStore, image images.Image) (*ocispec.Descriptor, error) {
-	log.Info(ctx, "Building SOCI index")
-	platform := platforms.DefaultSpec() // TODO: make this a user option
+	log.Info(ctx, "Building SOCI v2 index")
 
 	artifactsDb, err := initSociArtifactsDb(dataDir)
 	if err != nil {
@@ -152,37 +144,23 @@ func buildIndex(ctx context.Context, dataDir string, sociStore *store.SociStore,
 		return nil, err
 	}
 
-	builder, err := soci.NewIndexBuilder(containerdStore, sociStore, artifactsDb, soci.WithPlatform(platform))
+	builder, err := soci.NewIndexBuilder(containerdStore, sociStore,
+		soci.WithArtifactsDb(artifactsDb),
+		soci.WithBuildToolIdentifier("standalone-soci-indexer"),
+	)
 	if err != nil {
 		return nil, err
 	}
 
-	// Build the SOCI index
-	index, err := builder.Build(ctx, image)
+	// Convert builds the SOCI v2 index and wraps the image manifest + SOCI index
+	// into an OCI image index. For single-platform images it automatically detects
+	// the platform from the image config.
+	ociIndexDesc, err := builder.Convert(ctx, image)
 	if err != nil {
 		return nil, err
 	}
 
-	// Write the SOCI index to the OCI store
-	err = soci.WriteSociIndex(ctx, index, sociStore, artifactsDb)
-	if err != nil {
-		return nil, err
-	}
-
-	// Get SOCI indices for the image from the OCI store
-	// TODO: consider making soci's WriteSociIndex to return the descriptor directly
-	indexDescriptorInfos, _, err := soci.GetIndexDescriptorCollection(ctx, containerdStore, artifactsDb, image, []ocispec.Platform{platform})
-	if err != nil {
-		return nil, err
-	}
-	if len(indexDescriptorInfos) == 0 {
-		return nil, errors.New("No SOCI indices found in OCI store")
-	}
-	sort.Slice(indexDescriptorInfos, func(i, j int) bool {
-		return indexDescriptorInfos[i].CreatedAt.Before(indexDescriptorInfos[j].CreatedAt)
-	})
-
-	return &indexDescriptorInfos[len(indexDescriptorInfos)-1].Descriptor, nil
+	return ociIndexDesc, nil
 }
 
 // Log and return error
