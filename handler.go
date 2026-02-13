@@ -169,7 +169,7 @@ func buildIndex(ctx context.Context, dataDir string, sociStore *store.SociStore,
 		return nil, err
 	}
 
-	builder, err := soci.NewIndexBuilder(containerdStore, sociStore, soci.WithArtifactsDb(artifactsDb), soci.WithBuildToolIdentifier("github.com/CloudSnorkel/standalone-soci-indexer"))
+	builder, err := soci.NewIndexBuilder(containerdStore, sociStore, soci.WithArtifactsDb(artifactsDb), soci.WithBuildToolIdentifier("github.com/sofatutor/standalone-soci-indexer"))
 	if err != nil {
 		return nil, err
 	}
