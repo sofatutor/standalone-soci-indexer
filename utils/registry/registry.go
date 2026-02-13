@@ -19,9 +19,9 @@ import (
 	"oras.land/oras-go/v2/registry/remote"
 	"oras.land/oras-go/v2/registry/remote/auth"
 
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/aws/session"
-	"github.com/aws/aws-sdk-go/service/ecr"
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/service/ecr"
 	"github.com/awslabs/soci-snapshotter/soci/store"
 
 	"github.com/sofatutor/standalone-soci-indexer/utils/log"
@@ -46,6 +46,13 @@ type Registry struct {
 }
 
 var RegistryNotSupportingOciArtifacts = errors.New("Registry does not support OCI artifacts")
+var ImageAlreadyIndexed = errors.New("Image already indexed")
+
+type Manifest struct {
+	ocispec.Manifest
+
+	Manifests []ocispec.Descriptor `json:"manifests"`
+}
 
 // Initialize a remote registry
 func Init(ctx context.Context, registryUrl string, authToken string) (*Registry, error) {
@@ -61,9 +68,9 @@ func Init(ctx context.Context, registryUrl string, authToken string) (*Registry,
 				"User-Agent":    {"Standalone SOCI Index Builder (oras-go)"},
 			},
 		}
-		log.Info(ctx, "Using auth token "+authToken)
+		log.Info(ctx, "Using auth token")
 	} else if isEcrRegistry(registryUrl) {
-		err := authorizeEcr(registry)
+		err := authorizeEcr(ctx, registry)
 		if err != nil {
 			return nil, err
 		}
@@ -108,6 +115,22 @@ func (registry *Registry) Push(ctx context.Context, sociStore *store.SociStore, 
 		}
 		return err
 	}
+
+	return nil
+}
+
+func (registry *Registry) Tag(ctx context.Context, indexDesc ocispec.Descriptor, repositoryName, tag string) error {
+	repo, err := registry.registry.Repository(ctx, repositoryName)
+	if err != nil {
+		return err
+	}
+
+	log.Info(ctx, fmt.Sprintf("Tagging index with %s", tag))
+	err = repo.Tag(ctx, indexDesc, tag)
+	if err != nil {
+		return fmt.Errorf("failed to tag artifact: %w", err)
+	}
+
 	return nil
 }
 
@@ -128,9 +151,9 @@ func (registry *Registry) HeadManifest(ctx context.Context, repositoryName strin
 
 // Call registry's getManifest and return the image's manifest
 // The image reference must be a digest because that's what oras-go FetchReference takes
-func (registry *Registry) GetManifest(ctx context.Context, repositoryName string, digest string) (ocispec.Manifest, error) {
+func (registry *Registry) GetManifest(ctx context.Context, repositoryName string, digest string) (Manifest, error) {
 	repo, err := registry.registry.Repository(ctx, repositoryName)
-	var manifest ocispec.Manifest
+	var manifest Manifest
 	if err != nil {
 		return manifest, err
 	}
@@ -173,6 +196,54 @@ func (registry *Registry) ValidateImageManifest(ctx context.Context, repositoryN
 	return fmt.Errorf("Unexpected config media type: %s, expected one of: %v.", manifest.Config.MediaType, ImageConfigMediaTypes)
 }
 
+// GetImageDigests inspects an image reference and returns all valid digets that need to be indexed.
+// For multi-arch images (docker manifest), that includes all digests mentioned by the manifest.
+// For normal images, it's just the image digest itself.
+func (registry *Registry) GetImageDigests(ctx context.Context, repositoryName string, digest string) (digests []string, err error) {
+	manifest, err := registry.GetManifest(ctx, repositoryName, digest)
+	if err != nil {
+		return
+	}
+
+	if manifest.MediaType == MediaTypeOCIIndexManifest {
+		err = ImageAlreadyIndexed
+		return
+	}
+
+	if manifest.MediaType == MediaTypeDockerManifestList {
+		// multi-arch iamge
+		for _, internalManifest := range manifest.Manifests {
+			if internalManifest.MediaType == MediaTypeDockerManifest {
+				internalDigest := fmt.Sprintf("%s:%s", internalManifest.Digest.Algorithm().String(), internalManifest.Digest.Encoded())
+				if registry.ValidateImageManifest(ctx, repositoryName, internalDigest) == nil {
+					digests = append(digests, internalDigest)
+				}
+			}
+		}
+
+		if len(digests) == 0 {
+			err = fmt.Errorf("Manifest contains no valid images.")
+		}
+
+		return
+	}
+
+	if manifest.Config.MediaType == "" {
+		err = fmt.Errorf("Empty config media type.")
+		return
+	}
+
+	for _, configMediaType := range ImageConfigMediaTypes {
+		if manifest.Config.MediaType == configMediaType {
+			digests = append(digests, digest)
+			return
+		}
+	}
+
+	err = fmt.Errorf("Unexpected config media type: %s, expected one of: %v.", manifest.Config.MediaType, ImageConfigMediaTypes)
+	return
+}
+
 // Check if a registry is an ECR registry
 func isEcrRegistry(registryUrl string) bool {
 	ecrRegistryUrlRegex := "\\d{12}\\.dkr\\.ecr\\.\\S+\\.amazonaws\\.com"
@@ -184,17 +255,23 @@ func isEcrRegistry(registryUrl string) bool {
 }
 
 // Authorize ECR registry
-func authorizeEcr(ecrRegistry *remote.Registry) error {
-	// getting ecr auth token
-	input := &ecr.GetAuthorizationTokenInput{}
-	var ecrClient *ecr.ECR
+func authorizeEcr(ctx context.Context, ecrRegistry *remote.Registry) error {
+	cfg, err := config.LoadDefaultConfig(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to load AWS config: %w", err)
+	}
+
+	var ecrClient *ecr.Client
 	ecrEndpoint := os.Getenv("ECR_ENDPOINT") // set this env var for custom, i.e. non default, aws ecr endpoint
 	if ecrEndpoint != "" {
-		ecrClient = ecr.New(session.New(&aws.Config{Endpoint: aws.String(ecrEndpoint)}))
+		ecrClient = ecr.NewFromConfig(cfg, func(o *ecr.Options) {
+			o.BaseEndpoint = aws.String(ecrEndpoint)
+		})
 	} else {
-		ecrClient = ecr.New(session.New())
+		ecrClient = ecr.NewFromConfig(cfg)
 	}
-	getAuthorizationTokenResponse, err := ecrClient.GetAuthorizationToken(input)
+
+	getAuthorizationTokenResponse, err := ecrClient.GetAuthorizationToken(ctx, &ecr.GetAuthorizationTokenInput{})
 	if err != nil {
 		return err
 	}
