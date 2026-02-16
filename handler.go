@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"os"
 	"path"
-	"sort"
 
 	"github.com/sofatutor/standalone-soci-indexer/utils/log"
 	registryutils "github.com/sofatutor/standalone-soci-indexer/utils/registry"
@@ -20,8 +19,6 @@ import (
 	"github.com/awslabs/soci-snapshotter/soci/store"
 	"github.com/containerd/containerd/content"
 	"github.com/containerd/containerd/content/local"
-	"github.com/containerd/containerd/platforms"
-
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 )
 
@@ -31,16 +28,16 @@ var (
 )
 
 const (
-	BuildFailedMessage          = "SOCI index build error"
-	PushFailedMessage           = "SOCI index push error"
-	SkipPushOnEmptyIndexMessage = "Skipping pushing SOCI index as it does not contain any zTOCs"
-	BuildAndPushSuccessMessage  = "Successfully built and pushed SOCI index"
+	BuildFailedMessage         = "SOCI index build error"
+	PushFailedMessage          = "SOCI index push error"
+	PushOnEmptyIndexMessage    = "SOCI index does not contain any zTOCs"
+	BuildAndPushSuccessMessage = "Successfully built and pushed SOCI index"
 
 	artifactsStoreName = "store"
 	artifactsDbName    = "artifacts.db"
 )
 
-func indexAndPush(ctx context.Context, repo string, digest string, registryUrl string, authToken string) (string, error) {
+func indexAndPush(ctx context.Context, repo string, tag string, newTags []string, registryUrl string, authToken string) (string, error) {
 	ctx = context.WithValue(ctx, "RegistryURL", registryUrl)
 
 	registry, err := registryutils.Init(ctx, registryUrl, authToken)
@@ -48,7 +45,7 @@ func indexAndPush(ctx context.Context, repo string, digest string, registryUrl s
 		return logAndReturnError(ctx, "Remote registry initialization error", err)
 	}
 
-	err = registry.ValidateImageManifest(ctx, repo, digest)
+	digests, err := registry.GetImageDigests(ctx, repo, tag)
 	if err != nil {
 		log.Warn(ctx, fmt.Sprintf("Image manifest validation error: %v", err))
 		// Returning a non error to skip retries
@@ -67,40 +64,61 @@ func indexAndPush(ctx context.Context, repo string, digest string, registryUrl s
 		return logAndReturnError(ctx, "OCI storage initialization error", err)
 	}
 
-	desc, err := registry.Pull(ctx, repo, sociStore, digest)
-	if err != nil {
-		return logAndReturnError(ctx, "Image pull error", err)
-	}
-
-	image := images.Image{
-		Name:   repo + "@" + digest,
-		Target: *desc,
-	}
-
-	indexDescriptor, err := buildIndex(ctx, dataDir, sociStore, image)
-	if err != nil {
-		if err.Error() == ErrEmptyIndex.Error() {
-			log.Warn(ctx, SkipPushOnEmptyIndexMessage)
-			return SkipPushOnEmptyIndexMessage, nil
+	for _, digest := range digests {
+		ctx := context.WithValue(ctx, "ImageDigest", digest)
+		desc, err := registry.Pull(ctx, repo, sociStore, digest)
+		if err != nil {
+			return logAndReturnError(ctx, "Image pull error", err)
 		}
-		return logAndReturnError(ctx, BuildFailedMessage, err)
-	}
-	ctx = context.WithValue(ctx, "SOCIIndexDigest", indexDescriptor.Digest.String())
 
-	err = registry.Push(ctx, sociStore, *indexDescriptor, repo)
-	if err != nil {
-		return logAndReturnError(ctx, PushFailedMessage, err)
-	}
+		image := images.Image{
+			Name:   repo + "@" + digest,
+			Target: *desc,
+		}
 
-	log.Info(ctx, BuildAndPushSuccessMessage)
+		indexDescriptor, err := buildIndex(ctx, dataDir, sociStore, image)
+		if err != nil {
+			if err.Error() == ErrEmptyIndex.Error() {
+				log.Warn(ctx, PushOnEmptyIndexMessage)
+
+				// tag when using --new-tag
+				// the user will be expecting those tags to exist whether or not we created an index
+				for _, newTag := range newTags {
+					if newTag != tag {
+						err = registry.Tag(ctx, *desc, repo, newTag)
+						if err != nil {
+							return logAndReturnError(ctx, PushFailedMessage, err)
+						}
+					}
+				}
+				return PushOnEmptyIndexMessage, nil
+			}
+			return logAndReturnError(ctx, BuildFailedMessage, err)
+		}
+		ctx = context.WithValue(ctx, "SOCIIndexDigest", indexDescriptor.Digest.String())
+
+		err = registry.Push(ctx, sociStore, *indexDescriptor, repo)
+		if err != nil {
+			return logAndReturnError(ctx, PushFailedMessage, err)
+		}
+
+		for _, newTag := range newTags {
+			err = registry.Tag(ctx, *indexDescriptor, repo, newTag)
+			if err != nil {
+				return logAndReturnError(ctx, PushFailedMessage, err)
+			}
+		}
+
+		log.Info(ctx, BuildAndPushSuccessMessage)
+	}
 	return BuildAndPushSuccessMessage, nil
 }
 
-// Create a temp directory in /tmp
+// Create a temp directory in /tmp or $TMPDIR
 // The directory is prefixed by the Lambda's request id
 func createTempDir(ctx context.Context) (string, error) {
 	log.Info(ctx, "Creating a directory to store images and SOCI artifacts")
-	tempDir, err := os.MkdirTemp("/tmp", "soci") // The temp dir name is prefixed by the request id
+	tempDir, err := os.MkdirTemp("", "soci") // The temp dir name is prefixed by the request id
 	return tempDir, err
 }
 
@@ -140,7 +158,6 @@ func initSociArtifactsDb(dataDir string) (*soci.ArtifactsDb, error) {
 // Build soci index for an image and returns its ocispec.Descriptor
 func buildIndex(ctx context.Context, dataDir string, sociStore *store.SociStore, image images.Image) (*ocispec.Descriptor, error) {
 	log.Info(ctx, "Building SOCI index")
-	platform := platforms.DefaultSpec() // TODO: make this a user option
 
 	artifactsDb, err := initSociArtifactsDb(dataDir)
 	if err != nil {
@@ -152,37 +169,13 @@ func buildIndex(ctx context.Context, dataDir string, sociStore *store.SociStore,
 		return nil, err
 	}
 
-	builder, err := soci.NewIndexBuilder(containerdStore, sociStore, artifactsDb, soci.WithPlatform(platform))
+	builder, err := soci.NewIndexBuilder(containerdStore, sociStore, soci.WithArtifactsDb(artifactsDb), soci.WithBuildToolIdentifier("github.com/sofatutor/standalone-soci-indexer"))
 	if err != nil {
 		return nil, err
 	}
 
-	// Build the SOCI index
-	index, err := builder.Build(ctx, image)
-	if err != nil {
-		return nil, err
-	}
-
-	// Write the SOCI index to the OCI store
-	err = soci.WriteSociIndex(ctx, index, sociStore, artifactsDb)
-	if err != nil {
-		return nil, err
-	}
-
-	// Get SOCI indices for the image from the OCI store
-	// TODO: consider making soci's WriteSociIndex to return the descriptor directly
-	indexDescriptorInfos, _, err := soci.GetIndexDescriptorCollection(ctx, containerdStore, artifactsDb, image, []ocispec.Platform{platform})
-	if err != nil {
-		return nil, err
-	}
-	if len(indexDescriptorInfos) == 0 {
-		return nil, errors.New("No SOCI indices found in OCI store")
-	}
-	sort.Slice(indexDescriptorInfos, func(i, j int) bool {
-		return indexDescriptorInfos[i].CreatedAt.Before(indexDescriptorInfos[j].CreatedAt)
-	})
-
-	return &indexDescriptorInfos[len(indexDescriptorInfos)-1].Descriptor, nil
+	index, err := builder.Convert(ctx, image)
+	return index, err
 }
 
 // Log and return error
