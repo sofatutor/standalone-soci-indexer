@@ -7,6 +7,7 @@
   * Does not need AWS CLI installed
 * Easier to use than https://github.com/awslabs/soci-snapshotter
 * Based on https://github.com/aws-ia/cfn-ecr-aws-soci-index-builder
+* Supports SOCI manifest v2
 
 ## Usage
 
